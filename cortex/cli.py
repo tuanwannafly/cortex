@@ -24,6 +24,7 @@ from cortex.network_config import NetworkConfig
 from cortex.notification_manager import NotificationManager
 from cortex.stack_manager import StackManager
 from cortex.validators import validate_api_key, validate_install_request
+from cortex.hardware_detection import estimate_gpu_battery_impact
 
 # Suppress noisy log messages in normal operation
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -930,6 +931,31 @@ class CortexCLI:
         # plus all the detailed health checks from doctor
         doctor = SystemDoctor()
         return doctor.run_checks()
+    
+    def gpu_battery(self) -> int:
+        """Estimate battery impact based on GPU usage"""
+        data = estimate_gpu_battery_impact()
+
+        cx_print(f"GPU Mode: {data['mode']}", "info")
+        print()
+
+        cx_print("Estimated power draw:", "info")
+        print(f"- Integrated GPU only: {data['estimates']['integrated']['power']}")
+        print(f"- Hybrid (idle dGPU): {data['estimates']['hybrid_idle']['power']}")
+        print(f"- NVIDIA active: {data['estimates']['nvidia_active']['power']}")
+        print()
+
+        cx_print("Estimated battery impact:", "info")
+        print(f"- Hybrid idle: {data['estimates']['hybrid_idle']['impact']}")
+        print(f"- NVIDIA active: {data['estimates']['nvidia_active']['impact']}")
+        print()
+
+        cx_print(
+            "Note: Estimates are heuristic and vary by hardware and workload.",
+            "warning",
+        )
+
+        return 0
 
     def wizard(self):
         """Interactive setup wizard for API key configuration"""
@@ -1639,6 +1665,13 @@ def main():
 
     # Status command (includes comprehensive health checks)
     subparsers.add_parser("status", help="Show comprehensive system status and health checks")
+    
+    # GPU battery estimation
+    subparsers.add_parser(
+        "gpu-battery",
+        help="Estimate battery impact of current GPU usage",
+    )
+
 
     # Ask command
     ask_parser = subparsers.add_parser("ask", help="Ask a question about your system")
@@ -1916,6 +1949,9 @@ def main():
             return 1
         elif args.command == "env":
             return cli.env(args)
+        elif args.command == "gpu-battery":
+            return cli.gpu_battery()
+
         else:
             parser.print_help()
             return 1
@@ -1933,6 +1969,8 @@ def main():
 
             traceback.print_exc()
         return 1
+
+
 
 
 if __name__ == "__main__":

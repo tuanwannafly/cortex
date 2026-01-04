@@ -752,3 +752,68 @@ if __name__ == "__main__":
         print(f"  Virtualization: {info.virtualization}")
 
     print("\n✅ Detection complete!")
+    
+    
+    
+import subprocess
+
+
+def _run(cmd: list[str]) -> str:
+    try:
+        return subprocess.check_output(cmd, stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return ""
+
+
+def detect_nvidia_gpu() -> bool:
+    return bool(_run(["nvidia-smi"]))
+
+
+def detect_gpu_mode() -> str:
+    """
+    Best-effort GPU mode detection
+    """
+    if not _run(["lspci"]):
+        return "Integrated"
+
+    if detect_nvidia_gpu():
+        return "NVIDIA"
+
+    return "Hybrid"
+
+
+def estimate_gpu_battery_impact() -> dict:
+    """
+    Heuristic battery impact estimation based on GPU mode.
+    No realtime measurement, safe for non-root usage.
+    """
+    mode = detect_gpu_mode()
+    nvidia_active = detect_nvidia_gpu()
+
+    estimates = {
+        "integrated": {
+            "power": "~6–8 W",
+            "impact": "baseline (best battery life)",
+        },
+        "hybrid_idle": {
+            "power": "~8–10 W",
+            "impact": "~10–15% less battery life",
+        },
+        "nvidia_active": {
+            "power": "~18–25 W",
+            "impact": "~30–40% less battery life",
+        },
+    }
+
+    if mode == "Integrated":
+        current = "integrated"
+    elif nvidia_active:
+        current = "nvidia_active"
+    else:
+        current = "hybrid_idle"
+
+    return {
+        "mode": mode,
+        "current": current,
+        "estimates": estimates,
+    }
