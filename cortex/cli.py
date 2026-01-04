@@ -18,13 +18,13 @@ from cortex.dependency_importer import (
     format_package_list,
 )
 from cortex.env_manager import EnvironmentManager, get_env_manager
+from cortex.hardware_detection import estimate_gpu_battery_impact
 from cortex.installation_history import InstallationHistory, InstallationStatus, InstallationType
 from cortex.llm.interpreter import CommandInterpreter
 from cortex.network_config import NetworkConfig
 from cortex.notification_manager import NotificationManager
 from cortex.stack_manager import StackManager
 from cortex.validators import validate_api_key, validate_install_request
-from cortex.hardware_detection import estimate_gpu_battery_impact
 
 # Suppress noisy log messages in normal operation
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -931,7 +931,7 @@ class CortexCLI:
         # plus all the detailed health checks from doctor
         doctor = SystemDoctor()
         return doctor.run_checks()
-    
+
     def gpu_battery(self) -> int:
         """Estimate battery impact based on GPU usage"""
         data = estimate_gpu_battery_impact()
@@ -1665,7 +1665,7 @@ def main():
 
     # Status command (includes comprehensive health checks)
     subparsers.add_parser("status", help="Show comprehensive system status and health checks")
-    
+
     # GPU battery estimation
     subparsers.add_parser(
         "gpu-battery",

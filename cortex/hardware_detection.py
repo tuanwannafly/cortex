@@ -752,10 +752,9 @@ if __name__ == "__main__":
         print(f"  Virtualization: {info.virtualization}")
 
     print("\n✅ Detection complete!")
-    
-    
-    
-import subprocess
+
+
+
 
 
 def _run(cmd: list[str]) -> str:
