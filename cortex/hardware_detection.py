@@ -752,3 +752,96 @@ if __name__ == "__main__":
         print(f"  Virtualization: {info.virtualization}")
 
     print("\n✅ Detection complete!")
+
+def _run(cmd: list[str]) -> str:
+    """
+    Run a system command and return its stdout output.
+
+    Args:
+        cmd: Command and arguments to execute.
+
+    Returns:
+        str: Standard output of the command, or an empty string if execution fails.
+    """
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=True,
+        )
+        return result.stdout.strip()
+    except (subprocess.CalledProcessError, OSError):
+        return ""
+    
+
+
+def detect_nvidia_gpu() -> bool:
+    """
+    Detect whether an NVIDIA GPU is present and available on the system.
+
+    This function checks for the presence of NVIDIA GPU indicators using
+    non-privileged system commands and files. It is designed to be safe to call
+    in user-space environments without requiring root access.
+
+    Returns:
+        bool: True if an NVIDIA GPU is detected, False otherwise.
+
+    Notes:
+        - This is a best-effort detection and may return False on systems where
+          NVIDIA drivers are installed but the GPU is powered down or hidden.
+        - Any underlying command execution errors are handled internally and
+          result in a False return value.
+    """
+    return bool(_run(["nvidia-smi"]))
+
+
+def detect_gpu_mode() -> str:
+    """
+    Best-effort GPU mode detection
+    """
+    if not _run(["lspci"]):
+        return "Integrated"
+
+    if detect_nvidia_gpu():
+        return "NVIDIA"
+
+    return "Hybrid"
+
+
+def estimate_gpu_battery_impact() -> dict[str, Any]:
+    """
+    Heuristic battery impact estimation based on GPU mode.
+    No realtime measurement, safe for non-root usage.
+    """
+    mode = detect_gpu_mode()
+    nvidia_active = detect_nvidia_gpu()
+
+    estimates = {
+        "integrated": {
+            "power": "~6–8 W",
+            "impact": "baseline (best battery life)",
+        },
+        "hybrid_idle": {
+            "power": "~8–10 W",
+            "impact": "~10–15% less battery life",
+        },
+        "nvidia_active": {
+            "power": "~18–25 W",
+            "impact": "~30–40% less battery life",
+        },
+    }
+
+    if mode == "Integrated":
+        current = "integrated"
+    elif nvidia_active:
+        current = "nvidia_active"
+    else:
+        current = "hybrid_idle"
+
+    return {
+        "mode": mode,
+        "current": current,
+        "estimates": estimates,
+    }
