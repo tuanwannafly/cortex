@@ -7,6 +7,8 @@ recommendations and system configuration.
 Issue: #253
 """
 
+from __future__ import annotations
+
 import builtins
 import contextlib
 import json
@@ -756,13 +758,11 @@ if __name__ == "__main__":
 
 def _run(cmd: list[str]) -> str:
     """
-    Run a system command and return its stdout output.
+    Run a system command and return stdout.
 
-    Args:
-        cmd: Command and arguments to execute.
-
-    Returns:
-        str: Standard output of the command, or an empty string if execution fails.
+    Notes:
+    - Uses check=False so we can still parse stdout even when returncode != 0.
+      (Some driver/tool combinations emit useful output but exit non-zero.)
     """
     try:
         result = subprocess.run(
@@ -770,11 +770,55 @@ def _run(cmd: list[str]) -> str:
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
-            check=True,
+            check=False,
         )
-        return result.stdout.strip()
-    except (subprocess.CalledProcessError, OSError):
+    except OSError:
         return ""
+
+    return (result.stdout or "").strip()
+
+
+def get_nvidia_power_draw_watts() -> float | None:
+    """
+    Return real-time NVIDIA GPU power draw in Watts when available.
+
+    Robust against:
+    - non-zero return codes (still parse stdout)
+    - extra units/text
+    - multi-GPU output (sums all GPUs)
+    - comma decimal separators (e.g., "123,4")
+    """
+    try:
+        proc = subprocess.run(
+            ["nvidia-smi", "--query-gpu=power.draw", "--format=csv,noheader,nounits"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+        )
+    except OSError:
+        return None
+
+    out = (proc.stdout or "").strip()
+    if not out:
+        return None
+
+    vals: list[float] = []
+    for line in out.splitlines():
+        s = line.strip()
+        if not s or s.upper() == "N/A":
+            continue
+        # support both "123.4" and "123,4"
+        s = s.replace(",", ".")
+        m = re.search(r"[-+]?\d*\.?\d+", s)
+        if not m:
+            continue
+        try:
+            vals.append(float(m.group(0)))
+        except ValueError:
+            continue
+
+    return float(sum(vals)) if vals else None
 
 
 def detect_nvidia_gpu() -> bool:
@@ -816,21 +860,23 @@ def detect_gpu_mode() -> str:
 
 def estimate_gpu_battery_impact() -> dict[str, Any]:
     """
-    Detect whether an NVIDIA GPU is present and accessible on the system.
+    Estimate battery impact based on detected GPU usage mode.
 
-    This function checks for the availability of an NVIDIA GPU by attempting
-    to invoke the `nvidia-smi` command using a non-privileged subprocess call.
-    It does not require root access and is safe to call in user-space
-    environments.
+    This function combines:
+    - Best-effort GPU mode detection (Integrated / Hybrid / NVIDIA)
+    - Heuristic power and battery impact estimates
+    - Optional real measurements (battery + NVIDIA power draw) when available
+
+    The function is safe to call in user space, does not require root access,
+    and gracefully degrades when system metrics are unavailable.
 
     Returns:
-        bool: True if an NVIDIA GPU is detected via `nvidia-smi`,
-        False if the command is unavailable or no NVIDIA GPU is detected.
-
-    Note:
-        This is a best-effort detection method. It may return False on systems
-        where NVIDIA drivers are installed but the GPU is powered down,
-        unavailable, or `nvidia-smi` is not present in PATH.
+        dict[str, Any]: {
+            "mode": str,            # Integrated | Hybrid | NVIDIA
+            "current": str,         # integrated | hybrid_idle | nvidia_active
+            "estimates": dict,      # heuristic power & impact estimates
+            "measured": dict        # optional real measurements (if available)
+        }
     """
     mode = detect_gpu_mode()
     nvidia_active = detect_nvidia_gpu()
@@ -857,8 +903,153 @@ def estimate_gpu_battery_impact() -> dict[str, Any]:
     else:
         current = "hybrid_idle"
 
-    return {
+    measured: dict[str, Any] = {}
+
+    # =========================
+    # REAL MEASUREMENTS (SAFE)
+    # =========================
+
+    # Battery metrics (Linux first, then WSL/Windows fallback)
+    try:
+        battery = get_battery_metrics()
+        if battery is None:
+            battery = get_windows_battery_metrics()
+        if battery:
+            measured["battery"] = battery
+    except Exception:
+        pass
+
+    # NVIDIA power draw (best-effort)
+    try:
+        power_w = get_nvidia_power_draw_watts()
+        if power_w is not None:
+            measured["nvidia_power_w"] = power_w
+    except Exception:
+        pass
+
+    result = {
         "mode": mode,
         "current": current,
         "estimates": estimates,
     }
+
+    if measured:
+        result["measured"] = measured
+
+    return result
+
+
+def get_battery_metrics() -> dict[str, Any] | None:
+    """
+    Best-effort Linux battery metrics via /sys/class/power_supply/BAT*.
+    Safe (no root). Returns None if unavailable.
+    """
+    base = "/sys/class/power_supply"
+    if not os.path.isdir(base):
+        return None
+
+    bats = sorted([d for d in os.listdir(base) if d.startswith("BAT")])
+    if not bats:
+        return None
+
+    bat_dir = os.path.join(base, bats[0])
+
+    def _read_str(name: str) -> str | None:
+        p = os.path.join(bat_dir, name)
+        try:
+            with open(p, encoding="utf-8") as f:
+                return f.read().strip()
+        except OSError:
+            return None
+
+    def _read_int(name: str) -> int | None:
+        s = _read_str(name)
+        if s is None:
+            return None
+        try:
+            return int(s)
+        except ValueError:
+            return None
+
+    status = _read_str("status")
+    percent = _read_int("capacity")
+
+    # Power draw (if available). Units usually in µW (micro-watts).
+    power_now = _read_int("power_now")
+    if power_now is None:
+        # Some systems expose current_now (µA) + voltage_now (µV)
+        current_now = _read_int("current_now")
+        voltage_now = _read_int("voltage_now")
+        if current_now is not None and voltage_now is not None:
+            # (µA * µV) = pW => convert to W
+            power_watts = abs(current_now * voltage_now) / 1e12
+        else:
+            power_watts = None
+    else:
+        power_watts = abs(power_now) / 1e6
+
+    out: dict[str, Any] = {}
+    if status:
+        out["status"] = status
+    if percent is not None:
+        out["percent"] = percent
+    if power_watts is not None:
+        out["power_watts"] = power_watts
+
+    return out or None
+
+
+def get_windows_battery_metrics() -> dict[str, Any] | None:
+    """
+    Best-effort Windows/WSL battery metrics via PowerShell (if available).
+    Safe (no admin). Returns None if unavailable.
+    """
+    try:
+        import json
+        import subprocess
+
+        # On Windows: "powershell"
+        # On WSL: typically "powershell.exe" exists if Windows interop is enabled
+        ps = "powershell" if os.name == "nt" else "powershell.exe"
+
+        cmd = [
+            ps,
+            "-NoProfile",
+            "-Command",
+            "Get-CimInstance Win32_Battery | "
+            "Select-Object -First 1 EstimatedChargeRemaining,BatteryStatus | "
+            "ConvertTo-Json -Compress",
+        ]
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=2)
+
+        if p.returncode != 0 or not p.stdout.strip():
+            return None
+
+        data = json.loads(p.stdout)
+
+        percent = data.get("EstimatedChargeRemaining")
+        status_code = data.get("BatteryStatus")
+
+        # Minimal mapping (optional)
+        status_map = {
+            1: "Discharging",
+            2: "AC",
+            3: "Fully Charged",
+            4: "Low",
+            5: "Critical",
+            6: "Charging",
+        }
+
+        out: dict[str, Any] = {}
+        if percent is not None:
+            try:
+                out["percent"] = int(percent)
+            except (TypeError, ValueError):
+                pass
+        if status_code is not None:
+            out["status"] = status_map.get(status_code, str(status_code))
+
+        return out or None
+
+    except Exception:
+        return None

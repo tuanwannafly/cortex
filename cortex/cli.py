@@ -19,7 +19,18 @@ from cortex.dependency_importer import (
     format_package_list,
 )
 from cortex.env_manager import EnvironmentManager, get_env_manager
-from cortex.hardware_detection import estimate_gpu_battery_impact
+from cortex.gpu_manager import (
+    apply_gpu_mode_switch,
+    detect_gpu_switch_backend,
+    get_app_gpu_preference,
+    get_per_app_gpu_env,
+    list_app_gpu_preferences,
+    plan_gpu_mode_switch,
+    remove_app_gpu_preference,
+    run_command_with_env,
+    set_app_gpu_preference,
+)
+from cortex.hardware_detection import detect_gpu_mode, estimate_gpu_battery_impact
 from cortex.installation_history import InstallationHistory, InstallationStatus, InstallationType
 from cortex.llm.interpreter import CommandInterpreter
 from cortex.network_config import NetworkConfig
@@ -1014,30 +1025,172 @@ class CortexCLI:
         doctor = SystemDoctor()
         return doctor.run_checks()
 
-    def gpu_battery(self) -> int:
-        """Estimate battery impact based on GPU usage"""
+    def gpu_battery(self, args: argparse.Namespace | None = None) -> int:
+        """
+        Estimate battery impact based on current GPU usage and mode.
+
+        Prints:
+        - Heuristic estimates (unless --measured-only)
+        - Measured battery discharge (if available)
+        - Measured NVIDIA GPU power draw (when supported by nvidia-smi)
+        """
         data = estimate_gpu_battery_impact()
+        measured_only = bool(getattr(args, "measured_only", False))
 
-        cx_print(f"GPU Mode: {data['mode']}", "info")
+        mode = data.get("mode", "Unknown")
+        estimates = data.get("estimates") or {}
+
+        measured = data.get("measured") or {}
+        battery = measured.get("battery") or {}
+
+        # NVIDIA power (compat keys)
+        nvidia_watts = measured.get("nvidia_power_w")
+        if nvidia_watts is None:
+            nvidia_watts = measured.get("nvidia_power_watts")
+        if nvidia_watts is None:
+            nvidia_watts = measured.get("nvidia_power")
+
+        has_battery_data = bool(battery)
+        has_nvidia_data = nvidia_watts is not None
+
+        cx_print(f"GPU Mode: {mode}", "info")
         print()
 
-        cx_print("Estimated power draw:", "info")
-        print(f"- Integrated GPU only: {data['estimates']['integrated']['power']}")
-        print(f"- Hybrid (idle dGPU): {data['estimates']['hybrid_idle']['power']}")
-        print(f"- NVIDIA active: {data['estimates']['nvidia_active']['power']}")
-        print()
+        if not measured_only:
+            cx_print("Estimated power draw:", "info")
+            print(f"- Integrated GPU only: {estimates.get('integrated', {}).get('power', 'N/A')}")
+            print(f"- Hybrid (idle dGPU): {estimates.get('hybrid_idle', {}).get('power', 'N/A')}")
+            print(f"- NVIDIA active: {estimates.get('nvidia_active', {}).get('power', 'N/A')}")
+            print()
 
-        cx_print("Estimated battery impact:", "info")
-        print(f"- Hybrid idle: {data['estimates']['hybrid_idle']['impact']}")
-        print(f"- NVIDIA active: {data['estimates']['nvidia_active']['impact']}")
-        print()
+            cx_print("Estimated battery impact:", "info")
+            print(f"- Hybrid idle: {estimates.get('hybrid_idle', {}).get('impact', 'N/A')}")
+            print(f"- NVIDIA active: {estimates.get('nvidia_active', {}).get('impact', 'N/A')}")
+            print()
 
-        cx_print(
-            "Note: Estimates are heuristic and vary by hardware and workload.",
-            "warning",
-        )
+        if has_battery_data or has_nvidia_data:
+            cx_print("Measured (if available):", "info")
 
+            if has_battery_data:
+                status = battery.get("status")
+                percent = battery.get("percent")
+                power_watts = battery.get("power_watts")
+                hours_remaining = battery.get("hours_remaining")
+
+                if status:
+                    print(f"- Battery status: {status}")
+                if percent is not None:
+                    print(f"- Battery: {percent}%")
+                if power_watts is not None:
+                    try:
+                        print(f"- Battery draw: ~{float(power_watts):.2f} W")
+                    except (TypeError, ValueError):
+                        print(f"- Battery draw: ~{power_watts} W")
+                if hours_remaining is not None:
+                    try:
+                        print(f"- Est. time remaining: ~{float(hours_remaining):.2f} h")
+                    except (TypeError, ValueError):
+                        print(f"- Est. time remaining: ~{hours_remaining} h")
+
+            if has_nvidia_data:
+                try:
+                    print(f"- NVIDIA power draw: ~{float(nvidia_watts):.2f} W")
+                except (TypeError, ValueError):
+                    print(f"- NVIDIA power draw: ~{nvidia_watts} W")
+
+            print()
+        else:
+            if measured_only:
+                cx_print("No real measurements available on this system.", "warning")
+                cx_print("Tip: NVIDIA GPU power requires nvidia-smi.", "info")
+                cx_print(
+                    "Tip: Battery draw requires BAT* metrics (may be unavailable on WSL).", "info"
+                )
+                return 2
+
+        if not measured_only:
+            cx_print(
+                "Note: Estimates are heuristic and vary by hardware and workload.",
+                "warning",
+            )
         return 0
+
+    def gpu(self, args) -> int:
+        if args.gpu_command == "status":
+            backend = detect_gpu_switch_backend()
+            mode = detect_gpu_mode()
+            apps = list_app_gpu_preferences()
+            cx_print(f"GPU mode: {mode}")
+            cx_print(f"Switch backend: {backend.value}")
+            cx_print(f"Per-app assignments: {len(apps)}")
+            cx_print("Tip: `cortex gpu set integrated|hybrid|nvidia --dry-run`")
+            return 0
+
+        if args.gpu_command == "set":
+            plan = plan_gpu_mode_switch(args.mode)
+            if plan is None:
+                cx_print("No supported GPU switch backend found.")
+                return 2
+
+            cx_print(f"Backend: {plan.backend.value}")
+            cx_print(f"Target mode: {plan.target_mode}")
+            cx_print("Commands:")
+            for c in plan.commands:
+                cx_print("  " + " ".join(c))
+            cx_print(f"Restart required: {plan.requires_restart}")
+
+            if args.execute:
+                if not getattr(args, "yes", False):
+                    console.print("\n⚠ This will run GPU switch commands with sudo.")
+                    console.print("Proceed? [Y/n]: ", end="")
+                    resp = input().strip().lower()
+                    if resp and resp not in ("y", "yes"):
+                        return 0
+
+                return apply_gpu_mode_switch(plan, execute=True)
+
+            return 0
+
+        if args.gpu_command == "run":
+            cmd = list(args.cmd or [])
+            if cmd and cmd[0] == "--":
+                cmd = cmd[1:]
+            if not cmd:
+                cx_print("Missing command.")
+                return 2
+
+            if getattr(args, "nvidia", False):
+                env = get_per_app_gpu_env(use_nvidia=True)
+            elif getattr(args, "integrated", False):
+                env = get_per_app_gpu_env(use_nvidia=False)
+            elif getattr(args, "app", None):
+                env = get_per_app_gpu_env(app=args.app)
+            else:
+                cx_print("Specify --app or --nvidia / --integrated")
+                return 2
+
+            return run_command_with_env(cmd, extra_env=env)
+
+        if args.gpu_command == "app":
+            if args.app_action == "set":
+                set_app_gpu_preference(args.app, args.mode)
+                cx_print(f"Saved: {args.app} -> {args.mode}")
+                return 0
+            if args.app_action == "get":
+                pref = get_app_gpu_preference(args.app)
+                cx_print(f"{args.app}: {pref}")
+                return 0
+            if args.app_action == "list":
+                apps = list_app_gpu_preferences()
+                for k, v in apps.items():
+                    console.print(f"{k} -> {v}")
+                return 0
+            if args.app_action == "remove":
+                remove_app_gpu_preference(args.app)
+                return 0
+
+        cx_print("Unknown gpu command")
+        return 2
 
     def wizard(self):
         """Interactive setup wizard for API key configuration"""
@@ -2157,10 +2310,47 @@ def main():
     subparsers.add_parser("status", help="Show comprehensive system status and health checks")
 
     # GPU battery estimation
-    subparsers.add_parser(
+    gpu_battery_parser = subparsers.add_parser(
         "gpu-battery",
         help="Estimate battery impact of current GPU usage",
     )
+
+    gpu_battery_parser.add_argument(
+        "--measured-only",
+        action="store_true",
+        help="Show only real measurements (if available)",
+    )
+
+    gpu_parser = subparsers.add_parser("gpu", help="Hybrid GPU manager tools")
+    gpu_sub = gpu_parser.add_subparsers(dest="gpu_command", required=True)
+
+    gpu_sub.add_parser("status", help="Show GPU status")
+
+    gpu_set = gpu_sub.add_parser("set", help="Switch GPU mode")
+    gpu_set.add_argument("mode", choices=["integrated", "hybrid", "nvidia"])
+    gpu_set.add_argument("--dry-run", action="store_true")
+    gpu_set.add_argument("--execute", action="store_true")
+    gpu_set.add_argument("-y", "--yes", action="store_true")
+
+    gpu_app = gpu_sub.add_parser("app", help="Per-app GPU assignment")
+    gpu_app_sub = gpu_app.add_subparsers(dest="app_action", required=True)
+
+    gpu_app_sub.add_parser("list")
+    app_set = gpu_app_sub.add_parser("set")
+    app_set.add_argument("app")
+    app_set.add_argument("mode", choices=["nvidia", "integrated"])
+
+    app_get = gpu_app_sub.add_parser("get")
+    app_get.add_argument("app")
+
+    app_rm = gpu_app_sub.add_parser("remove")
+    app_rm.add_argument("app")
+
+    gpu_run = gpu_sub.add_parser("run")
+    gpu_run.add_argument("--app")
+    gpu_run.add_argument("--nvidia", action="store_true")
+    gpu_run.add_argument("--integrated", action="store_true")
+    gpu_run.add_argument("cmd", nargs=argparse.REMAINDER)
 
     # Ask command
     ask_parser = subparsers.add_parser("ask", help="Ask a question about your system")
@@ -2564,7 +2754,9 @@ def main():
         elif args.command == "env":
             return cli.env(args)
         elif args.command == "gpu-battery":
-            return cli.gpu_battery()
+            return cli.gpu_battery(args)
+        elif args.command == "gpu":
+            return cli.gpu(args)
 
         else:
             parser.print_help()
