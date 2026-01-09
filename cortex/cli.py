@@ -1043,12 +1043,8 @@ class CortexCLI:
         measured = data.get("measured") or {}
         battery = measured.get("battery") or {}
 
-        # NVIDIA power (compat keys)
+        # NVIDIA power draw (watts) - emitted by estimate_gpu_battery_impact() as "nvidia_power_w"
         nvidia_watts = measured.get("nvidia_power_w")
-        if nvidia_watts is None:
-            nvidia_watts = measured.get("nvidia_power_watts")
-        if nvidia_watts is None:
-            nvidia_watts = measured.get("nvidia_power")
 
         has_battery_data = bool(battery)
         has_nvidia_data = nvidia_watts is not None
@@ -1136,7 +1132,12 @@ class CortexCLI:
             return 0
 
         if args.gpu_command == "set":
-            plan = plan_gpu_mode_switch(args.mode)
+            try:
+                plan = plan_gpu_mode_switch(args.mode)
+            except ValueError as e:
+                cx_print(f"Invalid target GPU mode: {e}", "error")
+                return 1
+
             if plan is None:
                 cx_print("No supported GPU switch backend found.")
                 return 2
@@ -1208,8 +1209,13 @@ class CortexCLI:
                     console.print(f"{k} -> {v}")
                 return 0
             if args.app_action == "remove":
-                remove_app_gpu_preference(args.app)
-                return 0
+                removed = remove_app_gpu_preference(args.app)
+                if removed:
+                    cx_print(f"GPU preference removed for app '{args.app}'", "success")
+                    return 0
+
+                cx_print(f"No GPU preference found for app '{args.app}'", "warning")
+                return 1
 
         cx_print("Unknown gpu command")
         return 2
